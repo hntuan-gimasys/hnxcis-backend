@@ -116,8 +116,17 @@ jobs:
           fi
 
           # serviceusage.services.list may be denied for a least-privilege deployer;
-          # treat an unreadable list as "cannot verify" rather than a failure.
-          if ENABLED="$(gcloud services list --enabled --project "${PROJECT_ID}" --format='value(config.name)' 2>/dev/null)"; then
+          # treat an unreadable or empty list as "cannot verify" rather than "all
+          # disabled" -- a false positive here blocks a deploy that would succeed.
+          # `tr` flattens the line-separated output (CR included, so a Windows-built
+          # gcloud works too) into the space-delimited form the glob below matches;
+          # pipefail still surfaces a gcloud failure.
+          ENABLED=""
+          if ! ENABLED="$(gcloud services list --enabled --project "${PROJECT_ID}" --format='value(config.name)' 2>/dev/null | tr '\r\n' '  ')"; then
+            echo "::warning::Cannot list enabled APIs on ${PROJECT_ID} (missing serviceusage.services.list); skipping API check."
+          elif [ -z "${ENABLED// /}" ]; then
+            echo "::warning::Enabled-API list came back empty for ${PROJECT_ID}; skipping API check."
+          else
             missing=""
             for api in run.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com; do
               case " ${ENABLED} " in
@@ -129,8 +138,7 @@ jobs:
               echo "::error::Disabled API(s) on ${PROJECT_ID}:${missing} -- run: gcloud services enable${missing} --project=${PROJECT_ID}"
               exit 1
             fi
-          else
-            echo "::warning::Cannot list enabled APIs on ${PROJECT_ID} (missing serviceusage.services.list); skipping API check."
+            echo "Required APIs   : enabled"
           fi
 
       - name: Configure Docker for Artifact Registry
