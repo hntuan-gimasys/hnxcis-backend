@@ -41,7 +41,13 @@ env:
   FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID || vars.GCP_PROJECT_ID }}
   AUTH_REQUIRED: ${{ vars.AUTH_REQUIRED || 'false' }}
   GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.6-flash' }}
-  DB_PASSWORD_SECRET: ${{ vars.DB_PASSWORD_SECRET || 'hnxcis-db-password' }}
+  # The Cloud SQL password travels as a plain env var instead of a Secret Manager
+  # mount: the runtime service account holds roles/editor, which grants
+  # secretmanager.versions.get but NOT secretmanager.versions.access, and no
+  # principal available to this project can grant roles/secretmanager.secretAccessor.
+  # Trade-off accepted deliberately: the value is then readable in the Cloud Run
+  # service config by anyone holding run.viewer on the project.
+  SQL_PASSWORD: ${{ secrets.SQL_PASSWORD }}
   GEMINI_API_KEY_SECRET: ${{ vars.GEMINI_API_KEY_SECRET || 'hnxcis-gemini-api-key' }}
   ALLOW_UNAUTHENTICATED: ${{ vars.ALLOW_UNAUTHENTICATED || 'true' }}
   WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
@@ -65,10 +71,22 @@ jobs:
           if [ -z "${WIF_PROVIDER:-}" ] && [ -z "${{ secrets.GCP_SA_KEY }}" ]; then
             missing="$missing GCP_WORKLOAD_IDENTITY_PROVIDER-or-GCP_SA_KEY(secrets)"
           fi
+          if [ -z "${SQL_PASSWORD:-}" ]; then
+            missing="$missing SQL_PASSWORD(secrets)"
+          fi
           if [ -n "$missing" ]; then
             echo "::error::Missing required configuration:$missing"
             exit 1
           fi
+
+          # SQL_PASSWORD rides inside a '^##^'-delimited --set-env-vars list, so a
+          # literal '##' in the value would split it into bogus entries.
+          case "${SQL_PASSWORD:-}" in
+            *'##'*)
+              echo "::error::SQL_PASSWORD contains '##', the --set-env-vars delimiter. Rotate it to a value without that sequence."
+              exit 1
+              ;;
+          esac
 
       # --- Authenticate to Google Cloud -------------------------------------
       # Preferred: Workload Identity Federation (no long-lived keys).
@@ -141,6 +159,20 @@ jobs:
             echo "Required APIs   : enabled"
           fi
 
+          # GEMINI_API_KEY is optional in the app (src/config/env.ts), so a missing
+          # secret downgrades the feature instead of failing the deploy. Checking it
+          # here matters because Cloud Run reports a nonexistent secret as
+          # "Permission denied" -- missing and unreadable look identical at deploy
+          # time. Note this only needs secrets.get (covered by roles/editor); the
+          # revision itself still needs versions.access to mount it.
+          if gcloud secrets describe "${GEMINI_API_KEY_SECRET}" --project "${PROJECT_ID}" >/dev/null 2>&1; then
+            echo "GEMINI_SECRET_PRESENT=true" >> "$GITHUB_ENV"
+            echo "Gemini API key  : ${GEMINI_API_KEY_SECRET} (mounted)"
+          else
+            echo "GEMINI_SECRET_PRESENT=false" >> "$GITHUB_ENV"
+            echo "Gemini API key  : not configured (Gemini-backed routes disabled)"
+          fi
+
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet --project "${PROJECT_ID}"
 
@@ -174,6 +206,7 @@ jobs:
           ENV_VARS="^##^NODE_ENV=production"
           ENV_VARS="${ENV_VARS}##SQL_DB_NAME=${SQL_DB_NAME}"
           ENV_VARS="${ENV_VARS}##SQL_USER=${SQL_USER}"
+          ENV_VARS="${ENV_VARS}##SQL_PASSWORD=${SQL_PASSWORD}"
           ENV_VARS="${ENV_VARS}##FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}"
           ENV_VARS="${ENV_VARS}##AUTH_REQUIRED=${AUTH_REQUIRED}"
           ENV_VARS="${ENV_VARS}##GEMINI_MODEL=${GEMINI_MODEL}"
@@ -182,6 +215,13 @@ jobs:
           fi
           if [ -n "${CLOUD_SQL_INSTANCE:-}" ]; then
             ENV_VARS="${ENV_VARS}##INSTANCE_CONNECTION_NAME=${CLOUD_SQL_INSTANCE}"
+          fi
+
+          # Preflight sets GEMINI_SECRET_PRESENT; mounting a secret that does not
+          # exist fails the whole revision, so only mount what is actually there.
+          SECRETS=""
+          if [ "${GEMINI_SECRET_PRESENT:-false}" = "true" ]; then
+            SECRETS="GEMINI_API_KEY=${GEMINI_API_KEY_SECRET}:latest"
           fi
 
           ARGS=(
@@ -197,9 +237,16 @@ jobs:
             --min-instances "${{ vars.MIN_INSTANCES || '0' }}"
             --max-instances "${{ vars.MAX_INSTANCES || '10' }}"
             --set-env-vars "${ENV_VARS}"
-            --set-secrets "SQL_PASSWORD=${DB_PASSWORD_SECRET}:latest,GEMINI_API_KEY=${GEMINI_API_KEY_SECRET}:latest"
             --quiet
           )
+
+          # An empty --set-secrets is rejected, and omitting the flag entirely would
+          # leave a previously mounted secret in place, so clear explicitly instead.
+          if [ -n "${SECRETS}" ]; then
+            ARGS+=(--set-secrets "${SECRETS}")
+          else
+            ARGS+=(--clear-secrets)
+          fi
 
           # Mounts the Cloud SQL Unix socket at /cloudsql/<instance>.
           if [ -n "${CLOUD_SQL_INSTANCE:-}" ]; then
