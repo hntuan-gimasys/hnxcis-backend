@@ -240,11 +240,14 @@ jobs:
             --quiet
           )
 
-          # An empty --set-secrets is rejected, and omitting the flag entirely would
-          # leave a previously mounted secret in place, so clear explicitly instead.
+          # An empty --set-secrets is rejected. When there is nothing to mount, clear
+          # instead -- otherwise a secret mounted by an earlier deploy survives and
+          # keeps failing the revision. Only meaningful on an existing service, so
+          # skip the flag entirely when creating one.
           if [ -n "${SECRETS}" ]; then
             ARGS+=(--set-secrets "${SECRETS}")
-          else
+          elif gcloud run services describe "${SERVICE_NAME}" \
+              --project "${PROJECT_ID}" --region "${REGION}" >/dev/null 2>&1; then
             ARGS+=(--clear-secrets)
           fi
 
