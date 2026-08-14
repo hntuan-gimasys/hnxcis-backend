@@ -25,6 +25,10 @@ concurrency:
 
 env:
   PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  # google-github-actions/auth exports CLOUDSDK_CORE_PROJECT from the credentials,
+  # which outranks `gcloud config set project`. Pinning it here (workflow env wins
+  # over anything written to GITHUB_ENV) keeps every step on the intended project.
+  CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
   REGION: ${{ vars.GCP_REGION || 'asia-southeast1' }}
   AR_REPOSITORY: ${{ vars.AR_REPOSITORY || 'hnxcis' }}
   SERVICE_NAME: ${{ vars.CLOUD_RUN_SERVICE || 'hnxcis-backend' }}
@@ -74,6 +78,7 @@ jobs:
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+          project_id: ${{ env.PROJECT_ID }}
 
       # Fallback: service-account JSON key stored in the GCP_SA_KEY secret.
       - name: Authenticate to Google Cloud (service account key)
@@ -81,14 +86,55 @@ jobs:
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ env.PROJECT_ID }}
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
 
+      # Fails here with an actionable message instead of dying mid-deploy after a
+      # build+push against the wrong project.
+      - name: Preflight - project and API check
+        run: |
+          set -euo pipefail
+
+          ACTIVE="$(gcloud config get-value account 2>/dev/null || true)"
+          RESOLVED="$(gcloud config get-value project 2>/dev/null || true)"
+          echo "Authenticated as : ${ACTIVE}"
+          echo "Intended project : ${PROJECT_ID}"
+          echo "Resolved project : ${RESOLVED}"
+
+          if [ "${RESOLVED}" != "${PROJECT_ID}" ]; then
+            echo "::error::gcloud resolved project '${RESOLVED}' instead of '${PROJECT_ID}'."
+            exit 1
+          fi
+
+          if ! gcloud projects describe "${PROJECT_ID}" --format='value(projectId)' >/dev/null 2>&1; then
+            echo "::error::Project '${PROJECT_ID}' does not exist, or ${ACTIVE} lacks access to it. GCP_PROJECT_ID must be the project ID (globally unique), not the display name."
+            exit 1
+          fi
+
+          # serviceusage.services.list may be denied for a least-privilege deployer;
+          # treat an unreadable list as "cannot verify" rather than a failure.
+          if ENABLED="$(gcloud services list --enabled --project "${PROJECT_ID}" --format='value(config.name)' 2>/dev/null)"; then
+            missing=""
+            for api in run.googleapis.com artifactregistry.googleapis.com secretmanager.googleapis.com; do
+              case " ${ENABLED} " in
+                *" ${api} "*) ;;
+                *) missing="${missing} ${api}" ;;
+              esac
+            done
+            if [ -n "${missing}" ]; then
+              echo "::error::Disabled API(s) on ${PROJECT_ID}:${missing} -- run: gcloud services enable${missing} --project=${PROJECT_ID}"
+              exit 1
+            fi
+          else
+            echo "::warning::Cannot list enabled APIs on ${PROJECT_ID} (missing serviceusage.services.list); skipping API check."
+          fi
+
       - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet --project "${PROJECT_ID}"
 
       - name: Compute image tags
         id: image
@@ -132,6 +178,7 @@ jobs:
 
           ARGS=(
             "${SERVICE_NAME}"
+            --project "${PROJECT_ID}"
             --image "${{ steps.image.outputs.sha_tag }}"
             --region "${REGION}"
             --platform managed
@@ -162,7 +209,7 @@ jobs:
 
           gcloud run deploy "${ARGS[@]}"
 
-          URL="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
+          URL="$(gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --format='value(status.url)')"
           echo "url=${URL}" >> "$GITHUB_OUTPUT"
 
       - name: Verify health endpoint
