@@ -1,0 +1,195 @@
+name: Deploy Backend to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/workflows/db-migrate.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: false
+        default: 'production'
+
+# Required for Workload Identity Federation (keyless auth to GCP).
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-backend-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REGION: ${{ vars.GCP_REGION || 'asia-southeast1' }}
+  AR_REPOSITORY: ${{ vars.AR_REPOSITORY || 'hnxcis' }}
+  SERVICE_NAME: ${{ vars.CLOUD_RUN_SERVICE || 'hnxcis-backend' }}
+  RUNTIME_SERVICE_ACCOUNT: ${{ vars.CLOUD_RUN_RUNTIME_SA }}
+  CLOUD_SQL_INSTANCE: ${{ vars.CLOUD_SQL_INSTANCE }}
+  SQL_DB_NAME: ${{ vars.SQL_DB_NAME || 'hnxcis' }}
+  SQL_USER: ${{ vars.SQL_USER || 'hnxcis_app' }}
+  CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+  # Firebase project có thể khác project chạy Cloud Run.
+  FIREBASE_PROJECT_ID: ${{ vars.FIREBASE_PROJECT_ID || vars.GCP_PROJECT_ID }}
+  AUTH_REQUIRED: ${{ vars.AUTH_REQUIRED || 'false' }}
+  GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.6-flash' }}
+  DB_PASSWORD_SECRET: ${{ vars.DB_PASSWORD_SECRET || 'hnxcis-db-password' }}
+  GEMINI_API_KEY_SECRET: ${{ vars.GEMINI_API_KEY_SECRET || 'hnxcis-gemini-api-key' }}
+  ALLOW_UNAUTHENTICATED: ${{ vars.ALLOW_UNAUTHENTICATED || 'true' }}
+  WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+
+jobs:
+  deploy:
+    name: Build & deploy
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate configuration
+        run: |
+          missing=""
+          if [ -z "${PROJECT_ID:-}" ]; then
+            missing="$missing GCP_PROJECT_ID(vars)"
+          fi
+          if [ -z "${WIF_PROVIDER:-}" ] && [ -z "${{ secrets.GCP_SA_KEY }}" ]; then
+            missing="$missing GCP_WORKLOAD_IDENTITY_PROVIDER-or-GCP_SA_KEY(secrets)"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::Missing required configuration:$missing"
+            exit 1
+          fi
+
+      # --- Authenticate to Google Cloud -------------------------------------
+      # Preferred: Workload Identity Federation (no long-lived keys).
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        if: env.WIF_PROVIDER != ''
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+
+      # Fallback: service-account JSON key stored in the GCP_SA_KEY secret.
+      - name: Authenticate to Google Cloud (service account key)
+        if: env.WIF_PROVIDER == ''
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+
+      - name: Compute image tags
+        id: image
+        run: |
+          BASE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${SERVICE_NAME}"
+          echo "sha_tag=${BASE}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${BASE}:latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        run: |
+          docker build \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            -t "${{ steps.image.outputs.sha_tag }}" \
+            -t "${{ steps.image.outputs.latest_tag }}" \
+            .
+
+      - name: Push image
+        run: |
+          docker push "${{ steps.image.outputs.sha_tag }}"
+          docker push "${{ steps.image.outputs.latest_tag }}"
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        run: |
+          set -euo pipefail
+
+          # '^##^' sets a custom delimiter so values may contain commas
+          # (e.g. a multi-origin CORS_ORIGINS list).
+          ENV_VARS="^##^NODE_ENV=production"
+          ENV_VARS="${ENV_VARS}##SQL_DB_NAME=${SQL_DB_NAME}"
+          ENV_VARS="${ENV_VARS}##SQL_USER=${SQL_USER}"
+          ENV_VARS="${ENV_VARS}##FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}"
+          ENV_VARS="${ENV_VARS}##AUTH_REQUIRED=${AUTH_REQUIRED}"
+          ENV_VARS="${ENV_VARS}##GEMINI_MODEL=${GEMINI_MODEL}"
+          if [ -n "${CORS_ORIGINS:-}" ]; then
+            ENV_VARS="${ENV_VARS}##CORS_ORIGINS=${CORS_ORIGINS}"
+          fi
+          if [ -n "${CLOUD_SQL_INSTANCE:-}" ]; then
+            ENV_VARS="${ENV_VARS}##INSTANCE_CONNECTION_NAME=${CLOUD_SQL_INSTANCE}"
+          fi
+
+          ARGS=(
+            "${SERVICE_NAME}"
+            --image "${{ steps.image.outputs.sha_tag }}"
+            --region "${REGION}"
+            --platform managed
+            --port 8080
+            --cpu 1
+            --memory 512Mi
+            --timeout 300
+            --min-instances "${{ vars.MIN_INSTANCES || '0' }}"
+            --max-instances "${{ vars.MAX_INSTANCES || '10' }}"
+            --set-env-vars "${ENV_VARS}"
+            --set-secrets "SQL_PASSWORD=${DB_PASSWORD_SECRET}:latest,GEMINI_API_KEY=${GEMINI_API_KEY_SECRET}:latest"
+            --quiet
+          )
+
+          # Mounts the Cloud SQL Unix socket at /cloudsql/<instance>.
+          if [ -n "${CLOUD_SQL_INSTANCE:-}" ]; then
+            ARGS+=(--add-cloudsql-instances "${CLOUD_SQL_INSTANCE}")
+          fi
+          if [ -n "${RUNTIME_SERVICE_ACCOUNT:-}" ]; then
+            ARGS+=(--service-account "${RUNTIME_SERVICE_ACCOUNT}")
+          fi
+
+          if [ "${ALLOW_UNAUTHENTICATED}" = "true" ]; then
+            ARGS+=(--allow-unauthenticated)
+          else
+            ARGS+=(--no-allow-unauthenticated)
+          fi
+
+          gcloud run deploy "${ARGS[@]}"
+
+          URL="$(gcloud run services describe "${SERVICE_NAME}" --region "${REGION}" --format='value(status.url)')"
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify health endpoint
+        run: |
+          set -euo pipefail
+          URL="${{ steps.deploy.outputs.url }}"
+          for i in $(seq 1 10); do
+            if curl -fsS "${URL}/api/health"; then
+              echo ""
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying..."
+            sleep 5
+          done
+          echo "::error::Health check failed for ${URL}/api/health"
+          exit 1
+
+      - name: Summary
+        run: |
+          {
+            echo "### Backend deployed :rocket:"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Service | \`${SERVICE_NAME}\` |"
+            echo "| Region | \`${REGION}\` |"
+            echo "| URL | ${{ steps.deploy.outputs.url }} |"
+            echo "| Image | \`${{ steps.image.outputs.sha_tag }}\` |"
+            echo "| Cloud SQL | \`${CLOUD_SQL_INSTANCE:-not configured}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
