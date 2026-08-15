@@ -90,6 +90,41 @@ npm run db:migrate    # áp dụng migration (qua Cloud SQL Auth Proxy)
 Trên CI: chạy thủ công workflow **Migrate Cloud SQL (Drizzle)** (`workflow_dispatch`).
 Migration **không** chạy tự động khi deploy, để tránh sửa schema ngoài ý muốn.
 
+### 5.1. Migration thủ công trong `drizzle/manual/`
+
+RLS policy, hàm PL/pgSQL và trigger nằm ngoài khả năng biểu diễn của schema
+Drizzle, nên chúng được viết tay trong `drizzle/manual/` và **drizzle-kit không
+tự đọc thư mục này**. Chạy `db:generate` + `db:migrate` mà bỏ qua chúng sẽ cho
+ra một database trông có vẻ đúng nhưng **không có phân quyền, không chặn xoá
+cứng, audit sửa được** — nguy hiểm hơn là lỗi rõ ràng.
+
+| File | Nội dung |
+|---|---|
+| `0001_v12_rls_and_audit_guard.sql` | RLS + `FORCE ROW LEVEL SECURITY` cho 30/30 bảng, chặn DELETE vật lý, audit append-only |
+| `0002_v12_authz_bootstrap.sql` | Policy bootstrap danh tính theo `app.uid`, hàm `app_can_perform` (trục Chức năng × Trạng thái) |
+| `0003_v12_versioning.sql` | `app_create_version` (version-on-approved-edit), `app_soft_delete` |
+
+Thứ tự áp dụng, sau khi `db:generate` đã sinh migration schema:
+
+```bash
+# Tạo runtime role một lần cho mỗi database (chạy bằng SQL_ADMIN_USER):
+#   CREATE ROLE hnxcis_app LOGIN PASSWORD '<SQL_PASSWORD>' NOBYPASSRLS;
+
+npx drizzle-kit generate --custom --name=v12_rls_and_audit_guard
+npx drizzle-kit generate --custom --name=v12_authz_bootstrap
+npx drizzle-kit generate --custom --name=v12_versioning
+# dán nội dung từng file trong drizzle/manual/ vào migration trống tương ứng
+npm run db:migrate
+```
+
+**Runtime role `hnxcis_app` không được là chủ sở hữu bảng và không được có
+`BYPASSRLS`.** PostgreSQL bỏ qua RLS với chủ sở hữu; `FORCE ROW LEVEL SECURITY`
+bịt lỗ đó, nhưng `BYPASSRLS` thì không gì bịt được. Migration `0001` sẽ dừng và
+báo lỗi nếu phát hiện role có thuộc tính này.
+
+**Đừng áp dụng `0001` trước khi backend đã đặt session context.** Chưa có
+`SET LOCAL app.*` (xem `src/db/session.ts`) thì mọi truy vấn trả về 0 dòng.
+
 ## 6. Deploy
 
 Push lên nhánh `main` → workflow `.github/workflows/deploy-cloudrun.yml` sẽ:
