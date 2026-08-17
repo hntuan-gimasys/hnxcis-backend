@@ -56,6 +56,16 @@ env:
   SQL_DB_NAME: ${{ vars.SQL_DB_NAME || 'hnxcis' }}
   SQL_ADMIN_USER: ${{ vars.SQL_ADMIN_USER || 'postgres' }}
   DB_ADMIN_PASSWORD_SECRET: ${{ vars.DB_ADMIN_PASSWORD_SECRET || 'hnxcis-db-admin-password' }}
+  # Preferred source for the migration credential, for the same reason
+  # deploy-cloudrun.yml passes SQL_PASSWORD this way: the principal available here
+  # holds secretmanager.versions.get but NOT secretmanager.versions.access, and no
+  # principal in this project can grant roles/secretmanager.secretAccessor. Reading
+  # hnxcis-db-admin-password out of Secret Manager therefore fails with
+  # PERMISSION_DENIED no matter how the project is resolved.
+  #
+  # Secret Manager is still tried when this is empty, so an environment where the
+  # grant does exist keeps working without editing this file.
+  SQL_ADMIN_PASSWORD: ${{ secrets.SQL_ADMIN_PASSWORD }}
   WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
 
 jobs:
@@ -132,15 +142,31 @@ jobs:
             exit 1
           fi
 
-      - name: Read DB admin password from Secret Manager
+      - name: Resolve DB admin password
         id: secret
         run: |
           set -euo pipefail
-          # --project is explicit on purpose: it does not rely on whatever the
-          # resolved default happens to be at this point in the job.
-          PASSWORD="$(gcloud secrets versions access latest \
-            --secret="${DB_ADMIN_PASSWORD_SECRET}" \
-            --project="${PROJECT_ID}")"
+
+          if [ -n "${SQL_ADMIN_PASSWORD:-}" ]; then
+            echo "Source: SQL_ADMIN_PASSWORD (GitHub secret)"
+            PASSWORD="${SQL_ADMIN_PASSWORD}"
+          else
+            echo "Source: Secret Manager (${DB_ADMIN_PASSWORD_SECRET})"
+            # --project is explicit on purpose: it does not rely on whatever the
+            # resolved default happens to be at this point in the job.
+            if ! PASSWORD="$(gcloud secrets versions access latest \
+                  --secret="${DB_ADMIN_PASSWORD_SECRET}" \
+                  --project="${PROJECT_ID}" 2>/dev/null)"; then
+              echo "::error::Cannot read the migration credential. Secret Manager denied secretmanager.versions.access on '${DB_ADMIN_PASSWORD_SECRET}', which this project cannot grant. Add the Cloud SQL admin password as the GitHub secret SQL_ADMIN_PASSWORD instead: gh secret set SQL_ADMIN_PASSWORD --repo ${{ github.repository }}"
+              exit 1
+            fi
+          fi
+
+          if [ -z "${PASSWORD}" ]; then
+            echo "::error::The migration credential resolved to an empty string."
+            exit 1
+          fi
+
           echo "::add-mask::${PASSWORD}"
           echo "password=${PASSWORD}" >> "$GITHUB_OUTPUT"
 
