@@ -49,7 +49,17 @@ env:
   # service config by anyone holding run.viewer on the project.
   SQL_PASSWORD: ${{ secrets.SQL_PASSWORD }}
   GEMINI_API_KEY_SECRET: ${{ vars.GEMINI_API_KEY_SECRET || 'hnxcis-gemini-api-key' }}
-  ALLOW_UNAUTHENTICATED: ${{ vars.ALLOW_UNAUTHENTICATED || 'true' }}
+  # Defaults to 'false' for the same reason as the frontend repo: the bof-intern
+  # org enforces Domain Restricted Sharing (constraints/iam.allowedPolicyMemberDomains),
+  # which blocks granting allUsers access, so `--allow-unauthenticated` cannot
+  # actually take effect. Flip to 'true' (repository variable) once that policy
+  # has an exception for this project/service.
+  #
+  # Note this is a HARDER blocker for the backend than for the frontend: the SPA
+  # calls this API straight from the browser, and a browser cannot present the
+  # ID token that roles/run.invoker requires. So while this stays 'false' the
+  # app does not work end-to-end for real users, no matter what the frontend does.
+  ALLOW_UNAUTHENTICATED: ${{ vars.ALLOW_UNAUTHENTICATED || 'false' }}
   WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
 
 jobs:
@@ -267,6 +277,17 @@ jobs:
 
           gcloud run deploy "${ARGS[@]}"
 
+          # The deployer SA can create/update revisions but does NOT hold
+          # run.services.setIamPolicy, so this workflow cannot manage IAM bindings
+          # on the service. `--allow-unauthenticated` above is gcloud's own
+          # best-effort attempt and only warns on failure. Making the service
+          # actually reachable needs a project/org admin to run ONE-TIME:
+          #   gcloud run services add-iam-policy-binding "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --member=allUsers --role=roles/run.invoker
+          #   gcloud run services add-iam-policy-binding "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --member="serviceAccount:<deployer-sa-email>" --role=roles/run.invoker
+          # (the former needs a Domain Restricted Sharing exception in this org;
+          #  the latter just needs an admin with run.services.setIamPolicy.)
+          gcloud run services get-iam-policy "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" || true
+
           URL="$(gcloud run services describe "${SERVICE_NAME}" --project "${PROJECT_ID}" --region "${REGION}" --format='value(status.url)')"
           echo "url=${URL}" >> "$GITHUB_OUTPUT"
 
@@ -274,16 +295,62 @@ jobs:
         run: |
           set -euo pipefail
           URL="${{ steps.deploy.outputs.url }}"
-          for i in $(seq 1 10); do
-            if curl -fsS "${URL}/api/health"; then
+
+          # When the service requires authentication (ALLOW_UNAUTHENTICATED=false),
+          # anonymous requests never reach the container — Google's edge returns a
+          # generic 404 instead. Try an identity token scoped to this service's URL
+          # in case an admin separately granted this CI identity roles/run.invoker,
+          # but treat the HTTP check as best-effort rather than a hard gate:
+          # `gcloud run deploy` already blocked until the revision was Ready and
+          # serving 100% of traffic, which is the real confirmation the container
+          # started. A remaining 403/404 means this identity isn't authorized to
+          # call the service — not that the deploy is broken.
+          REQUIRE_HTTP_CHECK=true
+          AUTH_HEADER=()
+          if [ "${ALLOW_UNAUTHENTICATED}" != "true" ]; then
+            REQUIRE_HTTP_CHECK=false
+            ID_TOKEN="$(gcloud auth print-identity-token --audiences="${URL}" 2>/dev/null || echo "")"
+            if [ -n "${ID_TOKEN}" ]; then
+              AUTH_HEADER=(-H "Authorization: Bearer ${ID_TOKEN}")
+            fi
+          fi
+
+          # A brand-new Cloud Run service gets a freshly-minted *.run.app hostname;
+          # Google's edge routing/TLS for it can take minutes to propagate globally
+          # even after the revision reports Ready, and requests in that window come
+          # back 404. Subsequent deploys reuse the hostname and are ready at once.
+          # In the best-effort branch there is no propagation delay worth waiting
+          # out — without an invoker grant every attempt fails identically — so use
+          # a short budget there instead of the full 5 minutes.
+          if [ "${REQUIRE_HTTP_CHECK}" = "true" ]; then
+            ATTEMPTS=30
+            SLEEP_SECONDS=10
+          else
+            ATTEMPTS=3
+            SLEEP_SECONDS=5
+          fi
+
+          for i in $(seq 1 "${ATTEMPTS}"); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' "${AUTH_HEADER[@]}" "${URL}/api/health" || echo "000")"
+            if [ "${code}" = "200" ]; then
+              echo "Healthy after ${i} attempt(s)."
+              curl -sS "${AUTH_HEADER[@]}" "${URL}/api/health" || true
               echo ""
               exit 0
             fi
-            echo "Attempt $i failed, retrying..."
-            sleep 5
+            echo "Attempt ${i}/${ATTEMPTS}: /api/health=${code}, retrying in ${SLEEP_SECONDS}s..."
+            sleep "${SLEEP_SECONDS}"
           done
-          echo "::error::Health check failed for ${URL}/api/health"
-          exit 1
+
+          echo "--- Last response from ${URL}/api/health ---"
+          curl -sS -i "${AUTH_HEADER[@]}" "${URL}/api/health" || true
+
+          if [ "${REQUIRE_HTTP_CHECK}" = "true" ]; then
+            echo "::error::Health check failed for ${URL}/api/health after $((ATTEMPTS * SLEEP_SECONDS))s"
+            exit 1
+          fi
+
+          echo "::warning::Could not confirm ${URL}/api/health over HTTP — this CI identity likely isn't granted roles/run.invoker on ${SERVICE_NAME} (ALLOW_UNAUTHENTICATED=false and this workflow cannot self-grant that binding). Treating the earlier 'gcloud run deploy' success (revision Ready, serving 100% traffic) as the health signal instead."
 
       - name: Summary
         run: |
@@ -297,4 +364,6 @@ jobs:
             echo "| URL | ${{ steps.deploy.outputs.url }} |"
             echo "| Image | \`${{ steps.image.outputs.sha_tag }}\` |"
             echo "| Cloud SQL | \`${CLOUD_SQL_INSTANCE:-not configured}\` |"
+            echo "| SQL user | \`${SQL_USER}\`$( [ "${SQL_USER}" = "postgres" ] && echo ' — **RLS IS BYPASSED: superusers ignore FORCE ROW LEVEL SECURITY**' ) |"
+            echo "| Public access | \`${ALLOW_UNAUTHENTICATED}\`$( [ "${ALLOW_UNAUTHENTICATED}" != "true" ] && echo ' — **requires auth; the browser cannot call this API, so the app does not work end-to-end yet**' ) |"
           } >> "$GITHUB_STEP_SUMMARY"
