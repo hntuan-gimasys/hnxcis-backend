@@ -41,6 +41,16 @@ concurrency:
 
 env:
   PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  # google-github-actions/auth infers a project from the service account email and
+  # exports it as CLOUDSDK_CORE_PROJECT, which OUTRANKS `gcloud config set project`.
+  # A default compute SA is <number>-compute@developer.gserviceaccount.com, so the
+  # inferred project becomes the literal string "developer" and every gcloud call
+  # in this job hits the wrong (nonexistent) project. Pinning it here — workflow
+  # env beats anything the action writes to GITHUB_ENV — keeps the job on target.
+  # deploy-cloudrun.yml has carried this same pin for a while; this workflow was
+  # missing it, which is why the first automated migration failed on
+  # `secretmanager.googleapis.com not enabled on project [developer]`.
+  CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
   REGION: ${{ vars.GCP_REGION || 'asia-southeast1' }}
   CLOUD_SQL_INSTANCE: ${{ vars.CLOUD_SQL_INSTANCE }}
   SQL_DB_NAME: ${{ vars.SQL_DB_NAME || 'hnxcis' }}
@@ -78,29 +88,59 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
+      - name: Validate configuration
+        run: |
+          if [ -z "${PROJECT_ID:-}" ]; then
+            echo "::error::GCP_PROJECT_ID (repository variable) is empty. Without it gcloud falls back to whatever project google-github-actions/auth infers from the service account email — for a default compute SA that is the literal string 'developer'."
+            exit 1
+          fi
+          if [ -z "${CLOUD_SQL_INSTANCE:-}" ]; then
+            echo "::error::CLOUD_SQL_INSTANCE (repository variable) is empty. Expected the full connection name: project:region:instance."
+            exit 1
+          fi
+
       - name: Authenticate to Google Cloud (Workload Identity Federation)
         if: env.WIF_PROVIDER != ''
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+          project_id: ${{ env.PROJECT_ID }}
 
       - name: Authenticate to Google Cloud (service account key)
         if: env.WIF_PROVIDER == ''
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ env.PROJECT_ID }}
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: ${{ env.PROJECT_ID }}
 
+      # Fails here with an actionable message rather than midway through, after the
+      # proxy is up and a half-applied migration is possible.
+      - name: Preflight - confirm gcloud resolved the intended project
+        run: |
+          set -euo pipefail
+          RESOLVED="$(gcloud config get-value project 2>/dev/null || true)"
+          echo "Intended project : ${PROJECT_ID}"
+          echo "Resolved project : ${RESOLVED}"
+          if [ "${RESOLVED}" != "${PROJECT_ID}" ]; then
+            echo "::error::gcloud resolved project '${RESOLVED}' instead of '${PROJECT_ID}'. CLOUDSDK_CORE_PROJECT (exported by google-github-actions/auth from the service account email) outranks 'gcloud config set project'."
+            exit 1
+          fi
+
       - name: Read DB admin password from Secret Manager
         id: secret
         run: |
           set -euo pipefail
-          PASSWORD="$(gcloud secrets versions access latest --secret="${DB_ADMIN_PASSWORD_SECRET}")"
+          # --project is explicit on purpose: it does not rely on whatever the
+          # resolved default happens to be at this point in the job.
+          PASSWORD="$(gcloud secrets versions access latest \
+            --secret="${DB_ADMIN_PASSWORD_SECRET}" \
+            --project="${PROJECT_ID}")"
           echo "::add-mask::${PASSWORD}"
           echo "password=${PASSWORD}" >> "$GITHUB_OUTPUT"
 
