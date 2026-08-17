@@ -8,6 +8,7 @@ import express, { type Express } from 'express';
 import { env } from './config/env.ts';
 import { attachUser } from './middleware/auth.ts';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler.ts';
+import { attachRequestContext } from './middleware/requestContext.ts';
 import { apiRouter } from './routes/index.ts';
 
 function buildCorsOptions(): CorsOptions {
@@ -47,7 +48,10 @@ export function createApp(): Express {
     next();
   });
 
+  // attachUser xác thực token; attachRequestContext tra ra vai trò / tổ chức để
+  // RLS có dữ liệu mà phân quyền. Thứ tự này bắt buộc.
   app.use(attachUser);
+  app.use(attachRequestContext);
   app.use('/api', apiRouter);
 
   // Root: identify the service (this container serves the API only — the SPA is
