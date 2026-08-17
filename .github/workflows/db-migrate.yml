@@ -1,8 +1,25 @@
 name: Migrate Cloud SQL (Drizzle)
 
-# Migrations are deliberately NOT part of the deploy workflow: schema changes are
-# applied on purpose, by a human, through the Cloud SQL Auth Proxy.
+# Runs two ways:
+#
+#   workflow_call  - deploy-cloudrun.yml calls this BEFORE deploying the container,
+#                    so code never reaches Cloud Run ahead of the schema it needs.
+#                    `drizzle-kit migrate` is idempotent (it reads
+#                    drizzle.__drizzle_migrations and applies only what is pending),
+#                    so running it on every deploy costs seconds when nothing changed.
+#   workflow_dispatch - manual run, for applying a migration without shipping code.
+#
+# The `production` environment below is the safety gate: give it required reviewers
+# in Settings > Environments and every schema change waits for a human Approve,
+# whether it arrived via deploy or by hand.
 on:
+  workflow_call:
+    inputs:
+      command:
+        description: 'Drizzle command to run'
+        required: false
+        default: 'migrate'
+        type: string
   workflow_dispatch:
     inputs:
       command:
@@ -40,6 +57,17 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # `push` diffs schema.ts straight against the live database and never looks
+      # at drizzle/, so it silently skips migrations 0001-0003: the 30 tables show
+      # up, but RLS, the hard-delete guard, append-only audit and versioning do
+      # not. That is survivable as a deliberate manual act on an empty dev DB; it
+      # must never happen as a side effect of merging a pull request.
+      - name: Refuse `push` on an automated run
+        if: inputs.command == 'push' && github.event_name != 'workflow_dispatch'
+        run: |
+          echo '::error::drizzle-kit push is only allowed from a manual workflow_dispatch, not from an automated deploy. It bypasses migrations 0001-0003 and would drop RLS, the hard-delete guard, append-only audit and versioning.'
+          exit 1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -94,7 +122,7 @@ jobs:
           cat proxy.log
           exit 1
 
-      - name: Run drizzle-kit ${{ github.event.inputs.command }}
+      - name: Run drizzle-kit ${{ inputs.command }}
         env:
           SQL_HOST: 127.0.0.1
           SQL_PORT: '5432'
@@ -102,14 +130,14 @@ jobs:
           SQL_ADMIN_USER: ${{ env.SQL_ADMIN_USER }}
           SQL_ADMIN_PASSWORD: ${{ steps.secret.outputs.password }}
           SQL_SSL: 'false'
-        run: npm run db:${{ github.event.inputs.command }}
+        run: npm run db:${{ inputs.command }}
 
       - name: Summary
         run: |
           {
             echo "### Cloud SQL migration finished"
             echo ""
-            echo "- Command: \`drizzle-kit ${{ github.event.inputs.command }}\`"
+            echo "- Command: \`drizzle-kit ${{ inputs.command }}\`"
             echo "- Instance: \`${CLOUD_SQL_INSTANCE}\`"
             echo "- Database: \`${SQL_DB_NAME}\`"
           } >> "$GITHUB_STEP_SUMMARY"

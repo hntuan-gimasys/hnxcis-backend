@@ -6,7 +6,8 @@ on:
     paths-ignore:
       - '**.md'
       - 'docs/**'
-      - '.github/workflows/db-migrate.yml'
+      # db-migrate.yml is no longer ignored here: this workflow now calls it, so a
+      # change to it changes what deploy does and should be exercised by a deploy.
   workflow_dispatch:
     inputs:
       environment:
@@ -63,10 +64,38 @@ env:
   WIF_PROVIDER: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
 
 jobs:
+  # Schema first, container second. The reverse order leaves a window where the
+  # new code is live against the old schema and queries columns that do not exist
+  # yet. `drizzle-kit migrate` is idempotent — with nothing pending this job costs
+  # seconds — so it is cheap to run on every deploy and expensive to forget once.
+  #
+  # Skipped when CLOUD_SQL_INSTANCE is unset, which is the bootstrap case: the
+  # very first revision of a fresh project is deployed before Cloud SQL is wired
+  # up (see the comment on getDb() in src/db/index.ts). Without this guard that
+  # first deploy could never succeed.
+  #
+  # The approval gate lives in db-migrate.yml's `production` environment, not
+  # here: add required reviewers under Settings > Environments and every schema
+  # change waits for a human, while the deploy job below stays unattended.
+  migrate:
+    name: Database
+    if: vars.CLOUD_SQL_INSTANCE != ''
+    uses: ./.github/workflows/db-migrate.yml
+    with:
+      command: migrate
+    secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+
   deploy:
     name: Build & deploy
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment || 'production' }}
+    needs: migrate
+    # `needs` alone would cancel this job when migrate is skipped, so accept both
+    # success and skipped — but never a failure, which must block the deploy.
+    if: always() && (needs.migrate.result == 'success' || needs.migrate.result == 'skipped')
 
     steps:
       - name: Checkout
