@@ -220,7 +220,19 @@ gh secret   set GCP_DEPLOYER_SA                --repo "$GITHUB_ORG/$FRONTEND_REP
      --set-env-vars "CORS_ORIGINS=https://hnxcis-frontend-xyz789-as.a.run.app"
    ```
 4. Tạo schema database: chạy workflow **Migrate Cloud SQL (Drizzle)** với lệnh
-   `push` (lần đầu) hoặc `migrate` (khi đã có file migration trong `drizzle/`).
+   **`migrate`** — kể cả lần đầu.
+
+   > ⚠️ **Không dùng `push`.** `drizzle-kit push` sinh bảng thẳng từ `schema.ts` và
+   > **bỏ qua hoàn toàn** 3 migration thủ công `0001`–`0003`. Kết quả là có đủ 30
+   > bảng nhưng **không có** RLS, không có chặn xoá cứng, không có audit
+   > append-only, không có versioning — tức mất sạch các ràng buộc NT2/NT3/MT3 mà
+   > gói M1/M2 dựng lên, và mất **im lặng**: không lệnh nào báo lỗi.
+
+   Điều kiện tiên quyết: role runtime `hnxcis_app` phải tồn tại **trước khi** chạy
+   migration, nếu không `0001` sẽ dừng với `RAISE EXCEPTION`. Mục 3 ở trên đã tạo
+   nó bằng `gcloud sql users create "$SQL_APP_USER"`.
+
+5. **Kiểm tra RLS thực sự có hiệu lực** (xem mục 10).
 
 ## 10. Kiểm tra
 
@@ -233,6 +245,37 @@ curl -s "$BACKEND_URL/api/health/db"   # {"status":"ok","database":"hnxcis",...}
 curl -s "$FRONTEND_URL/env.js"         # window.__APP_CONFIG__ = { API_BASE_URL: "<backend url>" ... }
 ```
 
+### 10.1 Kiểm tra schema và RLS (bắt buộc sau lần migrate đầu tiên)
+
+Mở Cloud SQL Auth Proxy rồi vào bằng **user admin**:
+
+```bash
+cloud-sql-proxy --port 5432 "$INSTANCE_CONNECTION_NAME" &
+psql "host=127.0.0.1 port=5432 dbname=$SQL_DB user=postgres"
+```
+
+```sql
+-- Phải ra 30 bảng, 30 bảng bật RLS, 14 hàm app_*, 30 trigger chặn xoá cứng.
+SELECT count(*) FROM information_schema.tables WHERE table_schema='public';
+SELECT count(*) FROM pg_class WHERE relrowsecurity AND relnamespace='public'::regnamespace;
+SELECT count(*) FROM pg_proc  WHERE proname LIKE 'app!_%' ESCAPE '!';
+SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal;
+```
+
+Ba phép thử dưới đây phải **thất bại/lọc đúng**. Bắt buộc `SET ROLE hnxcis_app`
+trước: chạy dưới `postgres` sẽ luôn thấy hết vì **superuser bypass RLS bất kể
+`FORCE ROW LEVEL SECURITY`** — kiểm tra dưới `postgres` cho kết quả sai lệch.
+
+```sql
+SET ROLE hnxcis_app;
+SET app.actor_type = 'ORGANIZATION';
+SET app.org_id = '1';
+
+SELECT count(*) FROM submissions WHERE organization_id <> 1;  -- phải = 0
+DELETE FROM submissions WHERE id = 1;                         -- phải raise exception
+UPDATE audit_logs SET reason = 'x' WHERE id = 1;              -- phải raise exception
+```
+
 ## 11. Ghi chú vận hành
 
 - **Chi phí**: đặt `--min-instances=0` (mặc định) để scale-to-zero. Cloud SQL tính
@@ -240,6 +283,13 @@ curl -s "$FRONTEND_URL/env.js"         # window.__APP_CONFIG__ = { API_BASE_URL:
   "$SQL_INSTANCE" --activation-policy=NEVER`.
 - **Cold start + DB**: pool Postgres được mở lazy, `/api/health` không chạm DB nên
   startup probe không bị chậm vì Cloud SQL.
+- **`SQL_USER` phải luôn là `hnxcis_app`, tuyệt đối không phải `postgres`.**
+  PostgreSQL cho superuser bypass RLS **bất kể** `FORCE ROW LEVEL SECURITY`, và
+  `postgres` trên Cloud SQL là `cloudsqlsuperuser`. Đặt nhầm thành `postgres` thì
+  toàn bộ phân quyền dữ liệu (trục 2 của AuthZ Engine) biến mất mà **không có lỗi
+  nào được ném ra** — service vẫn chạy, chỉ là mọi doanh nghiệp đọc được dữ liệu
+  của nhau. `deploy-cloudrun.yml` mặc định đúng (`vars.SQL_USER || 'hnxcis_app'`);
+  chỉ cần đừng ghi đè biến `SQL_USER` ở repo thành `postgres`.
 - **Bảo mật**: khi đã có luồng đăng nhập Firebase ở frontend, bật
   `AUTH_REQUIRED=true` cho backend. Muốn chặn hẳn truy cập ẩn danh ở tầng hạ tầng,
   đặt biến `ALLOW_UNAUTHENTICATED=false` — khi đó frontend phải gọi backend kèm

@@ -27,6 +27,12 @@ jobs:
       - name: Typecheck
         run: npm run lint
 
+      # drizzle-kit không đọc drizzle/manual/ — nó chỉ chạy file có đăng ký trong
+      # meta/_journal.json. Sửa manual/ mà quên `npm run db:sync` sẽ khiến RLS và
+      # audit guard không bao giờ được áp lên database, mà không có lỗi nào báo.
+      - name: Check manual migrations are in sync
+        run: npm run db:sync:check
+
       - name: Build
         run: npm run build
 

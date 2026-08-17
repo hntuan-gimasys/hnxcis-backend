@@ -12,6 +12,8 @@
     "start": "node dist/server.cjs",
     "lint": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
+    "db:sync": "node scripts/sync-manual-migrations.mjs",
+    "db:sync:check": "node scripts/sync-manual-migrations.mjs --check",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio"
